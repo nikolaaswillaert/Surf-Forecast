@@ -1,0 +1,240 @@
+import logging
+import os
+
+import requests
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+
+load_dotenv()
+
+from scheduler import start_scheduler
+from storage import add_birthday, delete_birthday, load_birthdays
+from datetime import date, datetime, timedelta
+
+from surf_report import TZ, fetch_daily_surf_slots, fetch_weekly_surf_slots, format_daily_surf_report, format_weekly_surf_report
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+
+def format_date(day: int, month: int) -> str:
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(day if day < 20 else day % 10, "th")
+    month_name = ["January", "February", "March", "April", "May", "June",
+                  "July", "August", "September", "October", "November", "December"][month - 1]
+    return f"{day}{suffix} {month_name}"
+
+
+SURF_HELP_TEXT = (
+    "*Surf Report*\n"
+    "  surf — Current surf conditions at Oostende\n"
+    "  surf tomorrow — Surf forecast for tomorrow\n"
+    "  surf week — 5-day surf forecast\n"
+    "  surf help — Show this message"
+)
+
+HELP_TEXT = (
+    "*Birthday Reminder Bot*\n\n"
+    "Commands:\n"
+    "  bday add <name> <DD-MM> — Add a birthday\n"
+    "  bday list — Show all birthdays\n"
+    "  bday remove <name> — Remove a birthday\n"
+    "  bday help — Show this message\n\n"
+    + SURF_HELP_TEXT
+)
+
+
+def send_message(chat_id: str, text: str) -> None:
+    waha_base = os.environ["WAHA_BASE_URL"]
+    session = os.environ["WAHA_SESSION"]
+    api_key = os.environ.get("WAHA_API_KEY", "")
+    try:
+        resp = requests.post(
+            f"{waha_base}/api/sendText",
+            json={"chatId": chat_id, "text": text, "session": session},
+            headers={"X-Api-Key": api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.error("Failed to send message to %s: %s", chat_id, e)
+
+
+def handle_command(chat_id: str, text: str) -> None:
+    parts = text.strip().split()
+    if len(parts) < 2 or parts[0].lower() != "bday":
+        return
+
+    cmd = parts[1].lower()
+
+    if cmd == "help":
+        send_message(chat_id, HELP_TEXT)
+
+    elif cmd == "add":
+        if len(parts) < 4:
+            send_message(chat_id, "Usage: bday add <name> <DD-MM>\nExample: bday add John 15-03")
+            return
+        name = parts[2]
+        date_str = parts[3]
+        try:
+            day_str, month_str = date_str.split("-")
+            day, month = int(day_str), int(month_str)
+            if not (1 <= day <= 31 and 1 <= month <= 12):
+                raise ValueError
+        except ValueError:
+            send_message(chat_id, "Invalid date. Use DD-MM format, e.g. 15-03")
+            return
+        if add_birthday(name, day, month):
+            send_message(chat_id, f"Birthday added for {name} on {format_date(day, month)}.")
+        else:
+            send_message(chat_id, f"A birthday for {name} already exists. Remove it first.")
+
+    elif cmd == "list":
+        birthdays = load_birthdays()
+        if not birthdays:
+            send_message(chat_id, "No birthdays saved yet.")
+            return
+        sorted_bdays = sorted(birthdays, key=lambda b: (b["month"], b["day"]))
+        lines = [f"  {b['name']}: {format_date(b['day'], b['month'])}" for b in sorted_bdays]
+        send_message(chat_id, "Birthdays:\n" + "\n".join(lines))
+
+    elif cmd == "remove":
+        if len(parts) < 3:
+            send_message(chat_id, "Usage: bday remove <name>")
+            return
+        name = parts[2]
+        if delete_birthday(name):
+            send_message(chat_id, f"Birthday for {name} removed.")
+        else:
+            send_message(chat_id, f"No birthday found for {name}.")
+
+
+def handle_surf_command(chat_id: str, parts: list[str]) -> None:
+    sub = parts[1].lower() if len(parts) >= 2 else "report"
+    if sub == "help":
+        send_message(chat_id, SURF_HELP_TEXT)
+    elif sub == "report":
+        slots = fetch_daily_surf_slots(date.today())
+        if slots is None:
+            send_message(chat_id, "Could not fetch surf data. Try again later.")
+        else:
+            current_hour = datetime.now(TZ).hour
+            future_slots = [s for s in slots if s["hour"] >= current_hour]
+            if not future_slots:
+                tomorrow = date.today() + timedelta(days=1)
+                tomorrow_slots = fetch_daily_surf_slots(tomorrow)
+                if tomorrow_slots is None:
+                    send_message(chat_id, "No more slots today and couldn't fetch tomorrow's forecast.")
+                else:
+                    morning_slots = [s for s in tomorrow_slots if s["hour"] <= 7]
+                    report = format_daily_surf_report(morning_slots, tomorrow, is_forecast=True)
+                    send_message(chat_id, f"No more surf slots today! Here's tomorrow morning's forecast:\n\n{report}")
+            else:
+                report = format_daily_surf_report(future_slots, date.today())
+                send_message(chat_id, f"{report}\n\n📷 https://api.www.kustweerbericht.be/api/files/webcams/mrcc_c1.jpg")
+    elif sub == "tomorrow":
+        tomorrow = date.today() + timedelta(days=1)
+        slots = fetch_daily_surf_slots(tomorrow)
+        if slots is None:
+            send_message(chat_id, "Could not fetch tomorrow's forecast. Try again later.")
+        else:
+            send_message(chat_id, format_daily_surf_report(slots, tomorrow, is_forecast=True))
+    elif sub == "week":
+        days_data = fetch_weekly_surf_slots(date.today(), days=5)
+        if days_data is None:
+            send_message(chat_id, "Could not fetch weekly forecast. Try again later.")
+        else:
+            send_message(chat_id, format_weekly_surf_report(days_data))
+    else:
+        send_message(chat_id, "Unknown surf command. Try: surf report")
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "ignored"}), 200
+
+    if data.get("event") != "message.any":
+        return jsonify({"status": "ignored"}), 200
+
+    payload = data.get("payload", {})
+    to_field = payload.get("to", "")
+    from_field = payload.get("from", "")
+    # Group messages: 'to' is the group JID; DMs: 'from' is the sender
+    chat_id = to_field if to_field.endswith("@g.us") else from_field
+    text = payload.get("body", "").strip()
+    logger.info("Webhook: event=%s chat_id=%s text=%r", data.get("event"), chat_id, text)
+
+    owner_id = os.environ.get("REMINDER_CHAT_ID", "")
+    surf_group_id = os.environ.get("SURF_GROUP_CHAT_ID", "")
+
+    is_owner = chat_id == owner_id
+    is_surf_group = bool(surf_group_id) and chat_id == surf_group_id
+
+    if not is_owner and not is_surf_group:
+        logger.info("Ignored: from=%s", chat_id)
+        return jsonify({"status": "ignored"}), 200
+
+    if not text:
+        return jsonify({"status": "ignored"}), 200
+
+    parts = text.strip().split()
+    keyword = parts[0].lower()
+
+    if is_surf_group:
+        if keyword == "surf":
+            handle_surf_command(chat_id, parts)
+    elif is_owner:
+        if keyword == "bday":
+            handle_command(chat_id, text)
+        elif keyword == "surf":
+            handle_surf_command(chat_id, parts)
+
+    return jsonify({"status": "ok"}), 200
+
+
+def start_waha_session() -> None:
+    waha_base = os.environ["WAHA_BASE_URL"]
+    session = os.environ["WAHA_SESSION"]
+    api_key = os.environ.get("WAHA_API_KEY", "")
+    headers = {"X-Api-Key": api_key}
+    try:
+        status_resp = requests.get(
+            f"{waha_base}/api/sessions/{session}",
+            headers=headers,
+            timeout=10,
+        )
+        if status_resp.status_code == 200:
+            status = status_resp.json().get("status", "")
+            if status in ("WORKING", "STARTING"):
+                logger.info("WAHA session '%s' already %s.", session, status)
+                return
+        resp = requests.post(
+            f"{waha_base}/api/sessions/{session}/start",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 201:
+            logger.info("WAHA session '%s' started.", session)
+        else:
+            logger.warning("WAHA session start returned %s", resp.status_code)
+    except requests.RequestException as e:
+        logger.error("Could not start WAHA session: %s", e)
+
+
+if __name__ == "__main__":
+    host = os.environ.get("WEBHOOK_HOST", "0.0.0.0")
+    port = int(os.environ.get("WEBHOOK_PORT", 5000))
+    reminder_time = os.environ.get("REMINDER_TIME", "09:00")
+
+    start_waha_session()
+    scheduler = start_scheduler(reminder_time)
+    try:
+        app.run(host=host, port=port)
+    finally:
+        scheduler.shutdown()

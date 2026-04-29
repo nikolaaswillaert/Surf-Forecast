@@ -1,0 +1,52 @@
+=====================================
+ HOW TO START THE WHATSAPP BOT
+=====================================
+
+
+--- FIRST TIME SETUP ---
+
+1. Copy the example env file and fill in your WhatsApp number:
+     cp .env.example .env
+   Open .env and set REMINDER_CHAT_ID to your number (e.g. 32456271321@c.us)
+
+2. Build and start everything:
+     docker compose up -d --build
+
+3. Scan the QR code to link your WhatsApp:
+   - Open http://localhost:3000/dashboard in your browser
+   - Login: admin / 81e10788790e4ebb8dd943a4565a1040
+   - Click the session and scan the QR code with WhatsApp
+
+
+--- NORMAL START (after first setup) ---
+
+    docker compose up -d
+
+No QR scan needed — the session is saved automatically.
+
+
+--- STOP ---
+
+    docker compose stop
+
+
+--- UPDATE BOT CODE ONLY (no re-scan needed) ---
+
+    docker compose build bot && docker compose up -d bot
+
+
+--- VIEW LOGS ---
+
+    docker compose logs -f bot       (bot only)
+    docker compose logs -f           (everything)
+
+
+--- WHATSAPP COMMANDS ---
+
+  surf report   — Get current surf conditions for Oostende
+  surf tomorrow — Get tomorrow's surf forecast for Oostende
+  surf help     — Show help
+  bday add <name> <DD-MM>  — Add a birthday
+  bday list     — Show all birthdays
+  bday remove <name>       — Remove a birthday
+  bday help     — Show help

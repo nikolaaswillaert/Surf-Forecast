@@ -1,0 +1,36 @@
+services:
+  waha:
+    image: devlikeapro/waha
+    restart: unless-stopped
+    shm_size: 512mb
+    ports:
+      - "3000:3000"
+    environment:
+      # Tell WAHA to forward incoming messages to the bot's webhook
+      - WHATSAPP_HOOK_URL=http://172.18.0.1:5000/webhook
+      - WHATSAPP_HOOK_EVENTS=message.any
+      # Pinned credentials — dashboard login and API key
+      - WAHA_API_KEY=692371de248042efa8bde07344ab4a30
+      - WAHA_DASHBOARD_USERNAME=admin
+      - WAHA_DASHBOARD_PASSWORD=81e10788790e4ebb8dd943a4565a1040
+    volumes:
+      - waha_sessions:/app/.sessions
+
+  bot:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      # Override so bot talks to the waha container by service name
+      - WAHA_BASE_URL=http://waha:3000
+      - WEBHOOK_HOST=0.0.0.0
+    volumes:
+      # Persist birthdays.json on the host
+      - ./birthdays.json:/app/birthdays.json
+    depends_on:
+      - waha
+
+volumes:
+  waha_sessions:

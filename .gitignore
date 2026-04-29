@@ -1,0 +1,8 @@
+.env
+birthdays.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
