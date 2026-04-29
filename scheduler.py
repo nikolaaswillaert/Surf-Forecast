@@ -15,6 +15,7 @@ def _send_message(chat_id: str, text: str) -> None:
     waha_base = os.environ["WAHA_BASE_URL"]
     session = os.environ["WAHA_SESSION"]
     api_key = os.environ.get("WAHA_API_KEY", "")
+    
     try:
         resp = requests.post(
             f"{waha_base}/api/sendText",
