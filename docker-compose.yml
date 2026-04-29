@@ -6,13 +6,11 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # Tell WAHA to forward incoming messages to the bot's webhook
       - WHATSAPP_HOOK_URL=http://172.18.0.1:5000/webhook
       - WHATSAPP_HOOK_EVENTS=message.any
-      # Pinned credentials — dashboard login and API key
-      - WAHA_API_KEY=692371de248042efa8bde07344ab4a30
-      - WAHA_DASHBOARD_USERNAME=admin
-      - WAHA_DASHBOARD_PASSWORD=81e10788790e4ebb8dd943a4565a1040
+      - WAHA_API_KEY=${WAHA_API_KEY}
+      - WAHA_DASHBOARD_USERNAME=${WAHA_DASHBOARD_USERNAME}
+      - WAHA_DASHBOARD_PASSWORD=${WAHA_DASHBOARD_PASSWORD}
     volumes:
       - waha_sessions:/app/.sessions
 
