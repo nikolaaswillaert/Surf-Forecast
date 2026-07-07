@@ -11,7 +11,7 @@ from scheduler import start_scheduler
 from storage import add_birthday, delete_birthday, load_birthdays
 from datetime import date, datetime, timedelta
 
-from surf_report import TZ, fetch_daily_surf_slots, fetch_weekly_surf_slots, format_daily_surf_report, format_weekly_surf_report
+from surf_report import TZ, fetch_daily_surf_slots, fetch_weekly_surf_slots, fetch_high_tides_range, format_daily_surf_report, format_weekly_surf_report
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,7 +148,8 @@ def handle_surf_command(chat_id: str, parts: list[str]) -> None:
         if days_data is None:
             send_message(chat_id, "Could not fetch weekly forecast. Try again later.")
         else:
-            send_message(chat_id, format_weekly_surf_report(days_data))
+            high_tides = fetch_high_tides_range(date.today(), days=5)
+            send_message(chat_id, format_weekly_surf_report(days_data, high_tides))
     else:
         send_message(chat_id, "Unknown surf command. Try: surf report")
 

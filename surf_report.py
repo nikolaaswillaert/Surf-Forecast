@@ -1,9 +1,11 @@
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +19,10 @@ BEACH_FACE = 315
 DIRECTIONS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
               "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 
-REPORT_HOURS = [4, 7, 10, 13]
+REPORT_HOURS = [4, 7, 10, 13, 16, 19, 21]
 
-_SLOT_ICONS = {4: "🌅", 7: "☀️", 10: "🌤️", 13: "🌞"}
-_SLOT_LABELS = {4: "4:00 AM", 7: "7:00 AM", 10: "10:00 AM", 13: "1:00 PM"}
+_SLOT_ICONS = {4: "🌅", 7: "☀️", 10: "🌤️", 13: "🌞", 16: "🌇", 19: "🌆", 21: "🌙"}
+_SLOT_LABELS = {4: "04:00", 7: "07:00", 10: "10:00", 13: "13:00", 16: "16:00", 19: "19:00", 21: "21:00"}
 
 _RATING_ICONS = {
     "Epic": "🔥",
@@ -111,6 +113,61 @@ def _compute_rating(wave_height: float, wave_period: float | None,
         return "Fair"
     else:
         return "Poor"
+
+
+def fetch_high_tides_range(start_date: date, days: int = 1) -> dict[str, list[str]] | None:
+    """Return high tide times keyed by ISO date string, scraped from tide-forecast.com."""
+    url = "https://www.tide-forecast.com/locations/Oostende-Belgium/tides/latest"
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        end_date = start_date + timedelta(days=days)
+        result: dict[str, list[str]] = {}
+
+        sections = []
+        today_sec = soup.find(class_="tide-header-today")
+        if today_sec:
+            sections.append(today_sec)
+        sections.extend(soup.find_all(class_="tide-day"))
+
+        for section in sections:
+            date_match = re.search(r"(\w+\s+\d{1,2}\s+\w+\s+\d{4})", section.get_text())
+            if not date_match:
+                continue
+            try:
+                section_date = datetime.strptime(date_match.group(1), "%A %d %B %Y").date()
+            except ValueError:
+                continue
+            if not (start_date <= section_date < end_date):
+                continue
+            date_iso = section_date.isoformat()
+            # Each row: <td>High Tide</td><td><b>4:07 AM</b>...</td><td>height</td>
+            for row in section.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) < 2:
+                    continue
+                if "High Tide" not in cells[0].get_text():
+                    continue
+                time_b = cells[1].find("b")
+                if not time_b:
+                    continue
+                raw = time_b.get_text(strip=True)
+                try:
+                    dt = datetime.strptime(raw, "%I:%M %p")
+                    result.setdefault(date_iso, []).append(dt.strftime("%H:%M"))
+                except ValueError:
+                    continue
+
+        return result if result else None
+    except (requests.RequestException, ValueError) as e:
+        logger.error("Failed to fetch tide data: %s", e)
+        return None
 
 
 def fetch_weekly_surf_slots(start_date: date, days: int = 5) -> list[tuple[date, list[dict]]] | None:
@@ -227,7 +284,7 @@ def _best_rating(slots: list[dict]) -> str:
     return min(ratings, key=lambda r: order.index(r) if r in order else 99)
 
 
-def format_weekly_surf_report(days_data: list[tuple[date, list[dict]]]) -> str:
+def format_weekly_surf_report(days_data: list[tuple[date, list[dict]]], high_tides_by_date: dict[str, list[str]] | None = None) -> str:
     header = [
         "🏄 *Surf Forecast — Oostende* 🌊",
     ]
@@ -238,11 +295,16 @@ def format_weekly_surf_report(days_data: list[tuple[date, list[dict]]]) -> str:
         day_header = f"*{target_date.strftime('%A, %d %b')}*"
         if best:
             day_header += f"  —  Best: {best} {best_icon}"
+        if high_tides_by_date:
+            tides = high_tides_by_date.get(target_date.isoformat())
+            if tides:
+                day_header += f"\n🌊 High tides: {', '.join(tides)}"
         slot_lines = [_format_week_slot(s) for s in slots]
         slots_text = "\n".join(slot_lines)
         blocks.append(f"{day_header}\n────────────────────────\n{slots_text}")
     separator = "\n════════════════════════\n"
-    return "\n".join(header) + separator + separator.join(blocks)
+    footer = "\n\n📷 *Webcams:*\nhttps://www.meteobelgie.be/waarnemingen/belgie/webcam/106/oostende-strand\nhttps://twinsclub.be/info/meteo/"
+    return "\n".join(header) + separator + separator.join(blocks) + footer
 
 
 def fetch_daily_surf_slots(target_date: date) -> list[dict] | None:
@@ -345,13 +407,16 @@ def _format_slot(data: dict) -> str:
     return "\n".join(lines)
 
 
-def format_daily_surf_report(slots: list[dict], target_date: date, is_forecast: bool = False) -> str:
+def format_daily_surf_report(slots: list[dict], target_date: date, is_forecast: bool = False, high_tides: list[str] | None = None) -> str:
     tag = " _(forecast)_" if is_forecast else ""
     date_label = target_date.strftime("%A, %d %B %Y")
     header = [f"🏄 *Surf Report — Oostende* 🌊", f"📅 {date_label}{tag}"]
+    if high_tides:
+        header.append(f"🌊 High tides: {', '.join(high_tides)}")
     slot_blocks = [_format_slot(s) for s in slots]
     separator = "\n─────────────────\n"
-    return "\n".join(header) + separator + separator.join(slot_blocks)
+    footer = "\n\n📷 *Webcams:*\nhttps://www.meteobelgie.be/waarnemingen/belgie/webcam/106/oostende-strand\nhttps://twinsclub.be/info/meteo/"
+    return "\n".join(header) + separator + separator.join(slot_blocks) + footer
 
 
 # Keep for backwards compatibility (used nowhere currently but keeps API stable)
