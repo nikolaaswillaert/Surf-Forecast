@@ -11,7 +11,7 @@ from scheduler import start_scheduler
 from storage import add_birthday, delete_birthday, load_birthdays
 from datetime import date, datetime, timedelta
 
-from surf_report import TZ, fetch_daily_surf_slots, fetch_weekly_surf_slots, fetch_high_tides_range, format_daily_surf_report, format_weekly_surf_report
+from surf_report import TZ, fetch_daily_surf_slots, fetch_weekly_surf_slots, fetch_high_tides_range, fetch_stormglass_today, fetch_visualcrossing, format_daily_surf_report, format_weekly_surf_report
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,14 +29,6 @@ def format_date(day: int, month: int) -> str:
     return f"{day}{suffix} {month_name}"
 
 
-SURF_HELP_TEXT = (
-    "*Surf Report*\n"
-    "  surf — Current surf conditions at Oostende\n"
-    "  surf tomorrow — Surf forecast for tomorrow\n"
-    "  surf week — 5-day surf forecast\n"
-    "  surf help — Show this message"
-)
-
 HELP_TEXT = (
     "*Birthday Reminder Bot*\n\n"
     "Commands:\n"
@@ -44,7 +36,9 @@ HELP_TEXT = (
     "  bday list — Show all birthdays\n"
     "  bday remove <name> — Remove a birthday\n"
     "  bday help — Show this message\n\n"
-    + SURF_HELP_TEXT
+    "*Surf Report*\n"
+    "  surf — Today's surf conditions at Oostende\n"
+    "  surf week — 5-day surf forecast"
 )
 
 
@@ -114,44 +108,16 @@ def handle_command(chat_id: str, text: str) -> None:
 
 
 def handle_surf_command(chat_id: str, parts: list[str]) -> None:
-    sub = parts[1].lower() if len(parts) >= 2 else "report"
-    if sub == "help":
-        send_message(chat_id, SURF_HELP_TEXT)
-    elif sub == "report":
-        slots = fetch_daily_surf_slots(date.today())
-        if slots is None:
-            send_message(chat_id, "Could not fetch surf data. Try again later.")
-        else:
-            current_hour = datetime.now(TZ).hour
-            future_slots = [s for s in slots if s["hour"] >= current_hour]
-            if not future_slots:
-                tomorrow = date.today() + timedelta(days=1)
-                tomorrow_slots = fetch_daily_surf_slots(tomorrow)
-                if tomorrow_slots is None:
-                    send_message(chat_id, "No more slots today and couldn't fetch tomorrow's forecast.")
-                else:
-                    morning_slots = [s for s in tomorrow_slots if s["hour"] <= 7]
-                    report = format_daily_surf_report(morning_slots, tomorrow, is_forecast=True)
-                    send_message(chat_id, f"No more surf slots today! Here's tomorrow morning's forecast:\n\n{report}")
-            else:
-                report = format_daily_surf_report(future_slots, date.today())
-                send_message(chat_id, f"{report}\n\n📷 https://api.www.kustweerbericht.be/api/files/webcams/mrcc_c1.jpg")
-    elif sub == "tomorrow":
-        tomorrow = date.today() + timedelta(days=1)
-        slots = fetch_daily_surf_slots(tomorrow)
-        if slots is None:
-            send_message(chat_id, "Could not fetch tomorrow's forecast. Try again later.")
-        else:
-            send_message(chat_id, format_daily_surf_report(slots, tomorrow, is_forecast=True))
-    elif sub == "week":
-        days_data = fetch_weekly_surf_slots(date.today(), days=5)
-        if days_data is None:
-            send_message(chat_id, "Could not fetch weekly forecast. Try again later.")
-        else:
-            high_tides = fetch_high_tides_range(date.today(), days=5)
-            send_message(chat_id, format_weekly_surf_report(days_data, high_tides))
+    days_data = fetch_weekly_surf_slots(date.today(), days=5)
+    if days_data is None:
+        send_message(chat_id, "Could not fetch weekly forecast. Try again later.")
     else:
-        send_message(chat_id, "Unknown surf command. Try: surf report")
+        high_tides = fetch_high_tides_range(date.today(), days=5)
+        sg_key = os.environ.get("STORMGLASS_API_KEY", "")
+        sg_today = fetch_stormglass_today(sg_key) if sg_key else None
+        vc_key = os.environ.get("VISUALCROSSING_API_KEY", "")
+        vc_data = fetch_visualcrossing(vc_key) if vc_key else None
+        send_message(chat_id, format_weekly_surf_report(days_data, high_tides, sg_today=sg_today, vc_data=vc_data))
 
 
 @app.route("/webhook", methods=["POST"])

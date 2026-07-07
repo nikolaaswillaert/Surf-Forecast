@@ -6,7 +6,7 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from storage import get_todays_birthdays
-from surf_report import TZ, fetch_weekly_surf_slots, format_weekly_surf_report
+from surf_report import TZ, fetch_weekly_surf_slots, fetch_high_tides_range, fetch_stormglass_today, fetch_visualcrossing, format_weekly_surf_report
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,15 @@ def send_morning_surf_report() -> None:
         logger.error("Could not fetch surf data for morning report")
         return
 
-    report = format_weekly_surf_report(days_data)
+    high_tides = fetch_high_tides_range(date.today(), days=5)
+
+    sg_key = os.environ.get("STORMGLASS_API_KEY", "")
+    sg_today = fetch_stormglass_today(sg_key) if sg_key else None
+
+    vc_key = os.environ.get("VISUALCROSSING_API_KEY", "")
+    vc_data = fetch_visualcrossing(vc_key) if vc_key else None
+
+    report = format_weekly_surf_report(days_data, high_tides, sg_today=sg_today, vc_data=vc_data)
     _send_message(chat_id, report)
     logger.info("Sent morning weekly surf report to %s", chat_id)
 

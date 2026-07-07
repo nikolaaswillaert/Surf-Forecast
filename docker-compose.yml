@@ -27,6 +27,10 @@ services:
     volumes:
       # Persist birthdays.json on the host
       - ./birthdays.json:/app/birthdays.json
+      # Persist Stormglass cache to avoid burning daily quota on restarts
+      - ./stormglass_cache.json:/app/stormglass_cache.json
+      # Persist Visual Crossing cache (15-day response, one call per day)
+      - ./visualcrossing_cache.json:/app/visualcrossing_cache.json
     depends_on:
       - waha
 

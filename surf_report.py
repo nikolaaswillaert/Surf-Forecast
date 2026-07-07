@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -108,7 +109,7 @@ def _compute_rating(wave_height: float, wave_period: float | None,
 
     # Wind — glassy is as good as offshore; onshore kills it (max 3)
     if wind_speed is not None:
-        if wind_speed < 2:
+        if wind_speed < 4:
             score += 3  # Glassy / no wind
         elif wind_dir is not None:
             label = _wind_label(wind_dir)
@@ -201,7 +202,7 @@ def fetch_weekly_surf_slots(start_date: date, days: int = 5) -> list[tuple[date,
             params={
                 "latitude": LATITUDE,
                 "longitude": LONGITUDE,
-                "hourly": "wave_height,wave_period,wave_direction,wind_wave_height",
+                "hourly": "wave_height,wave_period,wave_direction,wind_wave_height,swell_wave_height,swell_wave_period",
                 "timezone": "Europe/Brussels",
                 "start_date": start_str,
                 "end_date": end_str,
@@ -244,6 +245,8 @@ def fetch_weekly_surf_slots(start_date: date, days: int = 5) -> list[tuple[date,
                     "wave_period": marine["wave_period"][idx],
                     "wave_direction": marine["wave_direction"][idx],
                     "wind_wave_height": marine["wind_wave_height"][idx],
+                    "swell_wave_height": marine["swell_wave_height"][idx],
+                    "swell_wave_period": marine["swell_wave_period"][idx],
                     "wind_speed": wind["wind_speed_10m"][idx],
                     "wind_gusts": wind["wind_gusts_10m"][idx],
                     "wind_direction": wind["wind_direction_10m"][idx],
@@ -307,25 +310,270 @@ def _best_rating(slots: list[dict]) -> str:
     return min(ratings, key=lambda r: order.index(r) if r in order else 99)
 
 
-def format_weekly_surf_report(days_data: list[tuple[date, list[dict]]], high_tides_by_date: dict[str, list[str]] | None = None) -> str:
+_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[float | None], unit: str = "m") -> str:
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return ""
+    mn, mx = min(vals), max(vals)
+    rng = mx - mn or 1
+    chars = [_SPARK[round((v - mn) / rng * 7)] if v is not None else " " for v in values]
+    return "".join(chars) + f"  {mn:.1f}–{mx:.1f}{unit}"
+
+
+_SG_CACHE_FILE = "/app/stormglass_cache.json"
+_sg_mem_cache: dict = {"date": None, "data": None}
+
+
+def _sg_load_file() -> dict:
+    try:
+        with open(_SG_CACHE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _sg_save_file(payload: dict) -> None:
+    try:
+        with open(_SG_CACHE_FILE, "w") as f:
+            json.dump(payload, f)
+    except OSError as e:
+        logger.error("Stormglass: failed to write cache file: %s", e)
+
+
+def fetch_stormglass_today(api_key: str) -> dict[int, dict] | None:
+    """Fetch today's hourly surf data from Stormglass.
+    Uses in-memory cache first, then persisted file cache, then API (if quota allows).
+    """
+    global _sg_mem_cache
+    today = date.today()
+    today_str = today.isoformat()
+
+    # 1. In-memory cache hit
+    if _sg_mem_cache["date"] == today and _sg_mem_cache["data"] is not None:
+        logger.info("Stormglass: in-memory cache hit for %s", today_str)
+        return _sg_mem_cache["data"]
+
+    # 2. File cache hit
+    file_cache = _sg_load_file()
+    if file_cache.get("date") == today_str and file_cache.get("data"):
+        data = {int(k): v for k, v in file_cache["data"].items()}
+        _sg_mem_cache = {"date": today, "data": data}
+        quota_used = file_cache.get("quota_used", 0)
+        quota_limit = file_cache.get("quota_limit", 10)
+        logger.info("Stormglass: file cache hit for %s (quota %s/%s)", today_str, quota_used, quota_limit)
+        return data
+
+    # 3. Quota exhausted — don't call API, return cached data if any (even if stale)
+    if file_cache.get("quota_used", 0) >= file_cache.get("quota_limit", 10):
+        logger.warning("Stormglass: daily quota exhausted, skipping API call")
+        if file_cache.get("data"):
+            return {int(k): v for k, v in file_cache["data"].items()}
+        return None
+
+    # 4. Fetch from API
+    start_utc = datetime(today.year, today.month, today.day, 0, 0, 0)
+    end_utc = datetime(today.year, today.month, today.day, 23, 0, 0)
+    try:
+        resp = requests.get(
+            "https://api.stormglass.io/v2/weather/point",
+            params={
+                "lat": LATITUDE,
+                "lng": LONGITUDE,
+                "params": "waveHeight,wavePeriod,waveDirection,swellHeight,swellPeriod,windSpeed,windDirection",
+                "start": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            headers={"Authorization": api_key},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        meta = raw.get("meta", {})
+        quota_used = meta.get("requestCount", 0)
+        quota_limit = meta.get("dailyQuota", 10)
+        logger.info("Stormglass: fetched from API, quota %s/%s", quota_used, quota_limit)
+
+        result: dict[int, dict] = {}
+        for slot in raw.get("hours", []):
+            dt = datetime.fromisoformat(slot["time"]).astimezone(TZ)
+            if dt.date() != today:
+                continue
+
+            def _pick(key: str, s: dict = slot) -> float | None:
+                v = s.get(key, {})
+                return v.get("sg") or v.get("noaa") or (next(iter(v.values()), None) if v else None)
+
+            result[dt.hour] = {
+                "wave_height": _pick("waveHeight"),
+                "wave_period": _pick("wavePeriod"),
+                "wave_direction": _pick("waveDirection"),
+                "swell_height": _pick("swellHeight"),
+                "swell_period": _pick("swellPeriod"),
+                "wind_speed": _pick("windSpeed"),
+                "wind_direction": _pick("windDirection"),
+            }
+
+        _sg_save_file({
+            "date": today_str,
+            "quota_used": quota_used,
+            "quota_limit": quota_limit,
+            "data": {str(k): v for k, v in result.items()},
+        })
+        _sg_mem_cache = {"date": today, "data": result}
+        return result
+    except (requests.RequestException, ValueError, KeyError) as e:
+        logger.error("Stormglass fetch failed: %s", e)
+        return None
+
+
+def _blend_with_sg(slot: dict, sg_today: dict[int, dict]) -> dict:
+    """Average Open-Meteo slot values with Stormglass for the same hour."""
+    sg = sg_today.get(slot["hour"])
+    if not sg:
+        return slot
+    slot = dict(slot)
+    for om_key, sg_key in [("wave_height", "wave_height"), ("wave_period", "wave_period"), ("wind_speed", "wind_speed")]:
+        if sg.get(sg_key) is not None and slot.get(om_key) is not None:
+            slot[om_key] = (slot[om_key] + sg[sg_key]) / 2
+    return slot
+
+
+_VC_CACHE_FILE = "/app/visualcrossing_cache.json"
+_vc_mem_cache: dict = {"date": None, "data": None}
+
+
+def _vc_load_file() -> dict:
+    try:
+        with open(_VC_CACHE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _vc_save_file(payload: dict) -> None:
+    try:
+        with open(_VC_CACHE_FILE, "w") as f:
+            json.dump(payload, f)
+    except OSError as e:
+        logger.error("VisualCrossing: failed to write cache file: %s", e)
+
+
+def fetch_visualcrossing(api_key: str) -> dict[str, dict[int, dict]] | None:
+    """Fetch 15-day surf forecast from Visual Crossing, cached per day.
+    Returns {date_str: {hour: {wave_height, swell_height, swell_period, swell_direction, wave_period}}}.
+    VC separates wind-wave (waveheight) and swell (swellheight); total = sum of both.
+    """
+    global _vc_mem_cache
+    today = date.today()
+    today_str = today.isoformat()
+
+    if _vc_mem_cache["date"] == today and _vc_mem_cache["data"] is not None:
+        logger.info("VisualCrossing: in-memory cache hit for %s", today_str)
+        return _vc_mem_cache["data"]
+
+    file_cache = _vc_load_file()
+    if file_cache.get("date") == today_str and file_cache.get("data"):
+        data = {d: {int(h): v for h, v in hrs.items()} for d, hrs in file_cache["data"].items()}
+        _vc_mem_cache = {"date": today, "data": data}
+        logger.info("VisualCrossing: file cache hit for %s", today_str)
+        return data
+
+    try:
+        resp = requests.get(
+            "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/oostende",
+            params={
+                "unitGroup": "us",
+                "elements": "add:maxwaveheight,add:swelldir,add:swellheight,add:swellperiod,add:wavedir,add:waveheight,add:waveperiod",
+                "key": api_key,
+                "contentType": "json",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        logger.info("VisualCrossing: fetched from API, queryCost=%s", raw.get("queryCost"))
+
+        result: dict[str, dict[int, dict]] = {}
+        for day in raw.get("days", []):
+            date_str = day["datetime"]
+            hours_data: dict[int, dict] = {}
+            for h in day.get("hours", []):
+                hr = int(h["datetime"][:2])
+                wind_h = h.get("waveheight") or 0
+                swell_h = h.get("swellheight") or 0
+                total_h = (wind_h + swell_h) * 0.3048  # ft → m
+                hours_data[hr] = {
+                    "wave_height": round(total_h, 2),
+                    "wave_period": h.get("waveperiod"),
+                    "swell_height": round(swell_h * 0.3048, 2),
+                    "swell_period": h.get("swellperiod"),
+                    "swell_direction": h.get("swelldir"),
+                }
+            result[date_str] = hours_data
+
+        _vc_save_file({"date": today_str, "data": result})
+        _vc_mem_cache = {"date": today, "data": result}
+        return result
+    except (requests.RequestException, ValueError, KeyError) as e:
+        logger.error("VisualCrossing fetch failed: %s", e)
+        return None
+
+
+def _blend_with_vc(slot: dict, vc_day: dict[int, dict]) -> dict:
+    """Blend Open-Meteo slot with Visual Crossing data for the same hour."""
+    vc = vc_day.get(slot["hour"])
+    if not vc:
+        return slot
+    slot = dict(slot)
+    if vc.get("wave_height") is not None and slot.get("wave_height") is not None:
+        slot["wave_height"] = (slot["wave_height"] + vc["wave_height"]) / 2
+    if vc.get("swell_period") is not None and slot.get("wave_period") is not None:
+        slot["wave_period"] = (slot["wave_period"] + vc["swell_period"]) / 2
+    if vc.get("swell_direction") is not None:
+        slot["wave_direction"] = vc["swell_direction"]
+    return slot
+
+
+def format_weekly_surf_report(days_data: list[tuple[date, list[dict]]], high_tides_by_date: dict[str, list[str]] | None = None, sg_today: dict[int, dict] | None = None, vc_data: dict[str, dict[int, dict]] | None = None) -> str:
     header = [
         "🏄 *Surf Forecast — Oostende* 🌊",
     ]
+    today = date.today()
     blocks = []
     for target_date, slots in days_data:
         tide_times = (high_tides_by_date or {}).get(target_date.isoformat(), [])
+        if target_date == today and sg_today:
+            slots = [_blend_with_sg(s, sg_today) for s in slots]
+        if vc_data:
+            vc_day = vc_data.get(target_date.isoformat(), {})
+            if vc_day:
+                slots = [_blend_with_vc(s, vc_day) for s in slots]
         enriched = [{**s, "near_high_tide": _is_near_high_tide(s["hour"], tide_times)} for s in slots]
         best = _best_rating(enriched)
         best_icon = _RATING_ICONS.get(best, "")
         day_header = f"*{target_date.strftime('%A, %d %b')}*"
-        if best:
-            day_header += f"  —  Best: {best} {best_icon}"
         if tide_times:
             day_header += f"\n🌊 High tides: {', '.join(tide_times)}"
+        swell_spark = _sparkline([s.get("wave_height") for s in enriched], unit="m")
+        period_spark = _sparkline([s.get("swell_wave_period") for s in enriched], unit="s")
+        wind_spark = _sparkline([s.get("wind_speed") for s in enriched], unit="m/s")
+        if swell_spark:
+            day_header += f"\n🌊 Waves:  {swell_spark}"
+        if period_spark:
+            day_header += f"\n⏱️ Period: {period_spark}"
+        if wind_spark:
+            day_header += f"\n💨 Wind:   {wind_spark}"
+            wind_labels = [_wind_label(s["wind_direction"]) for s in enriched if s.get("wind_direction") is not None]
+            if wind_labels:
+                dominant = max(set(wind_labels), key=wind_labels.count)
+                day_header += f"   {dominant} {_WIND_ICONS.get(dominant, '')}"
         slot_lines = [_format_week_slot(s) for s in enriched]
         slots_text = "\n".join(slot_lines)
-        blocks.append(f"{day_header}\n────────────────────────\n{slots_text}")
-    separator = "\n════════════════════════\n"
+        blocks.append(f"{day_header}\n──────────────────────\n{slots_text}")
+    separator = "\n══════════════════════\n"
     footer = "\n\n📷 *Webcams:*\nhttps://www.meteobelgie.be/waarnemingen/belgie/webcam/106/oostende-strand\nhttps://twinsclub.be/info/meteo/"
     return "\n".join(header) + separator + separator.join(blocks) + footer
 
@@ -439,7 +687,7 @@ def format_daily_surf_report(slots: list[dict], target_date: date, is_forecast: 
         header.append(f"🌊 High tides: {', '.join(high_tides)}")
     enriched = [{**s, "near_high_tide": _is_near_high_tide(s["hour"], high_tides or [])} for s in slots]
     slot_blocks = [_format_slot(s) for s in enriched]
-    separator = "\n─────────────────\n"
+    separator = "\n───────────────\n"
     footer = "\n\n📷 *Webcams:*\nhttps://www.meteobelgie.be/waarnemingen/belgie/webcam/106/oostende-strand\nhttps://twinsclub.be/info/meteo/"
     return "\n".join(header) + separator + separator.join(slot_blocks) + footer
 
