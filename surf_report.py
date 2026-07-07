@@ -13,8 +13,8 @@ LATITUDE = 51.23
 LONGITUDE = 2.92
 TZ = ZoneInfo("Europe/Brussels")
 
-# Oostende beach faces NW (~315°). Perfect offshore wind comes from SE (~135°).
-BEACH_FACE = 315
+# Oostende beach faces NNW (~337°). Ideal swell from N/NNW; offshore wind from SSE.
+BEACH_FACE = 337
 
 DIRECTIONS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
               "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
@@ -48,8 +48,16 @@ def _angle_diff(a: float, b: float) -> float:
     return abs((a - b + 180) % 360 - 180)
 
 
+def _is_near_high_tide(hour: int, high_tide_times: list[str], window_hours: float = 1.5) -> bool:
+    for t in high_tide_times:
+        hh, mm = map(int, t.split(":"))
+        if abs(hour - (hh + mm / 60)) <= window_hours:
+            return True
+    return False
+
+
 def _wind_label(wind_dir: float) -> str:
-    offshore_source = (BEACH_FACE + 180) % 360  # 135° = SE
+    offshore_source = (BEACH_FACE + 180) % 360  # 157° = SSE
     rel = _angle_diff(wind_dir, offshore_source)
     if rel <= 45:
         return "Offshore"
@@ -63,53 +71,66 @@ def _wind_label(wind_dir: float) -> str:
 
 def _compute_rating(wave_height: float, wave_period: float | None,
                     wave_dir: float | None, wind_speed: float | None,
-                    wind_dir: float | None) -> str:
+                    wind_dir: float | None, near_high_tide: bool = False) -> str:
     if wave_height < 0.3:
         return "Flat"
 
     score = 0
 
-    if wave_height >= 1.2:
+    # Wave height (max 4)
+    if wave_height >= 1.5:
         score += 4
-    elif wave_height >= 0.8:
+    elif wave_height >= 1.0:
         score += 3
-    elif wave_height >= 0.5:
+    elif wave_height >= 0.6:
         score += 2
     else:
         score += 1
 
+    # Period — 12s+ is clean groundswell; short period = choppy wind swell (max 4)
     if wave_period is not None:
-        if wave_period >= 7:
+        if wave_period >= 12:
+            score += 4
+        elif wave_period >= 9:
             score += 3
-        elif wave_period >= 5:
-            score += 2
-        elif wave_period >= 3:
+        elif wave_period >= 6:
             score += 1
 
+    # Swell direction — N to NNW is ideal for Oostende (max 3)
     if wave_dir is not None:
         rel = _angle_diff(wave_dir, BEACH_FACE)
-        if rel <= 45:
+        if rel <= 22.5:
+            score += 3
+        elif rel <= 45:
             score += 2
         elif rel <= 90:
             score += 1
 
-    if wind_dir is not None:
-        label = _wind_label(wind_dir)
-        if label == "Offshore":
-            score += 2
-        elif label == "Cross-offshore":
-            score += 1
-        elif label == "Onshore":
+    # Wind — glassy is as good as offshore; onshore kills it (max 3)
+    if wind_speed is not None:
+        if wind_speed < 2:
+            score += 3  # Glassy / no wind
+        elif wind_dir is not None:
+            label = _wind_label(wind_dir)
+            if label == "Offshore":
+                score += 2
+            elif label == "Cross-offshore":
+                score += 1
+            elif label == "Onshore":
+                score -= 2
+        if wind_speed > 8:
             score -= 1
 
-    if wind_speed is not None and wind_speed > 8:
-        score -= 1
+    # High tide preferred at Oostende (max 2)
+    if near_high_tide:
+        score += 2
 
-    if score >= 8:
+    # Max possible: 16 — thresholds calibrated accordingly
+    if score >= 11:
         return "Epic"
-    elif score >= 5:
+    elif score >= 7:
         return "Good"
-    elif score >= 3:
+    elif score >= 4:
         return "Fair"
     else:
         return "Poor"
@@ -262,7 +283,8 @@ def _format_week_slot(data: dict) -> str:
 
     rating_str = ""
     if wave_h is not None:
-        rating = _compute_rating(wave_h, wave_p, wave_dir, wind_speed, wind_dir)
+        rating = _compute_rating(wave_h, wave_p, wave_dir, wind_speed, wind_dir,
+                                 data.get("near_high_tide", False))
         ricon = _RATING_ICONS.get(rating, "")
         rating_str = f"{rating} {ricon}"
 
@@ -277,7 +299,8 @@ def _best_rating(slots: list[dict]) -> str:
         wh = s.get("wave_height")
         if wh is not None:
             r = _compute_rating(wh, s.get("wave_period"), s.get("wave_direction"),
-                                s.get("wind_speed"), s.get("wind_direction"))
+                                s.get("wind_speed"), s.get("wind_direction"),
+                                s.get("near_high_tide", False))
             ratings.append(r)
     if not ratings:
         return ""
@@ -290,16 +313,16 @@ def format_weekly_surf_report(days_data: list[tuple[date, list[dict]]], high_tid
     ]
     blocks = []
     for target_date, slots in days_data:
-        best = _best_rating(slots)
+        tide_times = (high_tides_by_date or {}).get(target_date.isoformat(), [])
+        enriched = [{**s, "near_high_tide": _is_near_high_tide(s["hour"], tide_times)} for s in slots]
+        best = _best_rating(enriched)
         best_icon = _RATING_ICONS.get(best, "")
         day_header = f"*{target_date.strftime('%A, %d %b')}*"
         if best:
             day_header += f"  —  Best: {best} {best_icon}"
-        if high_tides_by_date:
-            tides = high_tides_by_date.get(target_date.isoformat())
-            if tides:
-                day_header += f"\n🌊 High tides: {', '.join(tides)}"
-        slot_lines = [_format_week_slot(s) for s in slots]
+        if tide_times:
+            day_header += f"\n🌊 High tides: {', '.join(tide_times)}"
+        slot_lines = [_format_week_slot(s) for s in enriched]
         slots_text = "\n".join(slot_lines)
         blocks.append(f"{day_header}\n────────────────────────\n{slots_text}")
     separator = "\n════════════════════════\n"
@@ -400,7 +423,8 @@ def _format_slot(data: dict) -> str:
         lines.append(f"💨 Wind: {wind_speed:.0f} m/s{dir_str}{gusts_str}{wind_info_str}")
 
     if wave_h is not None:
-        rating = _compute_rating(wave_h, wave_p, wave_dir, wind_speed, wind_dir)
+        rating = _compute_rating(wave_h, wave_p, wave_dir, wind_speed, wind_dir,
+                                 data.get("near_high_tide", False))
         ricon = _RATING_ICONS.get(rating, "")
         lines.append(f"📊 Rating: {rating} {ricon}")
 
@@ -413,7 +437,8 @@ def format_daily_surf_report(slots: list[dict], target_date: date, is_forecast: 
     header = [f"🏄 *Surf Report — Oostende* 🌊", f"📅 {date_label}{tag}"]
     if high_tides:
         header.append(f"🌊 High tides: {', '.join(high_tides)}")
-    slot_blocks = [_format_slot(s) for s in slots]
+    enriched = [{**s, "near_high_tide": _is_near_high_tide(s["hour"], high_tides or [])} for s in slots]
+    slot_blocks = [_format_slot(s) for s in enriched]
     separator = "\n─────────────────\n"
     footer = "\n\n📷 *Webcams:*\nhttps://www.meteobelgie.be/waarnemingen/belgie/webcam/106/oostende-strand\nhttps://twinsclub.be/info/meteo/"
     return "\n".join(header) + separator + separator.join(slot_blocks) + footer
